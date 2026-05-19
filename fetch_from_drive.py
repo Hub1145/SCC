@@ -1,7 +1,8 @@
 """
 Download Real / Reconstructed / Synthetic data from Google Drive.
 
-Uses the official Google Drive API v3 with MediaIoBaseDownload.
+Uses Drive API v3 (API key) for folder listing only.
+File downloads go through gdown — no API quota, no rate-limit 403s.
 
 Usage:
     python scripts2/fetch_from_drive.py                    # all tiers
@@ -12,13 +13,10 @@ Usage:
 
 import os
 import sys
-import io
-import time
 import argparse
 
+import gdown
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,26 +53,10 @@ class GoogleDriveAPI:
                 break
         return items
 
-    def download_file(self, file_id: str, dest_path: str, max_retries: int = 5):
-        for attempt in range(max_retries):
-            try:
-                request    = self.service.files().get_media(fileId=file_id)
-                fh         = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request, chunksize=4 * 1024 * 1024)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                with open(dest_path, "wb") as f:
-                    f.write(fh.getvalue())
-                return
-            except HttpError as e:
-                if e.resp.status in (403, 429, 500, 503) and attempt < max_retries - 1:
-                    wait = 2 ** attempt * 5   # 5s, 10s, 20s, 40s
-                    print(f"    [HTTP {e.resp.status}] rate-limited, retrying in {wait}s ...")
-                    time.sleep(wait)
-                else:
-                    raise
+    def download_file(self, file_id: str, dest_path: str):
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, dest_path, quiet=True, fuzzy=True)
 
 
 # ── Recursive folder download ─────────────────────────────────────────────────
@@ -103,7 +85,6 @@ def _download_recursive(api: GoogleDriveAPI, folder_id: str,
                 print(f"{indent}  {name}  ({size_kb} KB)")
                 if not dry_run:
                     api.download_file(item_id, dest_path)
-                    time.sleep(0.3)
                 done += 1
     return done, skip
 
