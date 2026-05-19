@@ -56,7 +56,7 @@ class GoogleDriveAPI:
     def download_file(self, file_id: str, dest_path: str):
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         url = f"https://drive.google.com/uc?id={file_id}"
-        gdown.download(url, dest_path, quiet=True, fuzzy=True)
+        gdown.download(url, dest_path, quiet=True)
 
 
 # ── Recursive folder download ─────────────────────────────────────────────────
