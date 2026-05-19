@@ -47,6 +47,11 @@ SMOOTH_WINDOW = 5   # bars; adaptive — capped at len(mid)//5
 # Fix 2: flag events where fewer than this many bars exist after the peak
 MIN_POST_PEAK_BARS = 5
 
+# Background volatility thresholds (std dev of 1-min BTC mid-price returns)
+VOL_CALM_THRESHOLD     = 0.0010   # < 0.10% per bar  → calm
+VOL_VOLATILE_THRESHOLD = 0.0030   # > 0.30% per bar  → volatile
+                                   # in between       → normal
+
 PEAK_BUCKETS = [
     ("micro",   0.05, 0.10),
     ("small",   0.10, 0.20),
@@ -153,6 +158,36 @@ def _null_peak() -> dict:
     return {"increase": 0.0, "retracement": 0.0, "peak_idx": 0, "peak_truncated": False}
 
 
+def _market_ctx_path(l2_path: str) -> str:
+    return re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$', '_market_ctx.csv', l2_path)
+
+
+def compute_background_volatility(l2_path: str) -> str:
+    """
+    Classify background market volatility from the paired _market_ctx.csv.
+    Reads BTC mid-price, computes std dev of 1-min returns, and maps to
+    calm / normal / volatile using fixed thresholds.
+    Returns 'unknown' if the file is missing or unreadable.
+    """
+    ctx_path = _market_ctx_path(l2_path)
+    if not os.path.exists(ctx_path):
+        return "unknown"
+    try:
+        df = pd.read_csv(ctx_path, usecols=["bid_price", "ask_price"])
+        if len(df) < 5:
+            return "unknown"
+        mid     = ((df["bid_price"] + df["ask_price"]) / 2).values
+        returns = np.diff(mid) / mid[:-1]
+        vol     = float(np.std(returns))
+        if vol < VOL_CALM_THRESHOLD:
+            return "calm"
+        if vol > VOL_VOLATILE_THRESHOLD:
+            return "volatile"
+        return "normal"
+    except Exception:
+        return "unknown"
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -192,10 +227,6 @@ def main():
                 skipped += 1
                 continue
 
-            if "_direct_L2.csv" in l2_path and os.path.exists(mp) and not args.overwrite:
-                skipped += 1
-                continue
-
             coin_regime = regime_from_path(l2_path)
             result      = compute_peak(l2_path)
 
@@ -210,18 +241,28 @@ def main():
                 and retracement >= RETRACEMENT_THRESHOLD
             )
 
-            meta = {
-                "coin_regime":    coin_regime,
-                "market_regime":  "unknown",
-                "peak_pct":       round(increase * 100, 2) if coin_regime == "pump" else None,
-                "peak_bucket":    get_peak_bucket(increase) if is_pump else None,
-                "peak_idx":       int(peak_idx) if coin_regime == "pump" else None,
-                "peak_truncated": peak_truncated,   # Fix 2: preserved in meta
-            }
+            # Preserve existing fields (e.g. market_regime already set by Drive data)
+            existing = {}
+            if os.path.exists(mp):
+                try:
+                    with open(mp) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+
+            existing.update({
+                "coin_regime":          coin_regime,
+                "market_regime":        existing.get("market_regime", "unknown"),
+                "background_volatility": compute_background_volatility(l2_path),
+                "peak_pct":             round(increase * 100, 2) if coin_regime == "pump" else None,
+                "peak_bucket":          get_peak_bucket(increase) if is_pump else None,
+                "peak_idx":             int(peak_idx) if coin_regime == "pump" else None,
+                "peak_truncated":       peak_truncated,
+            })
 
             try:
                 with open(mp, "w") as f:
-                    json.dump(meta, f, indent=2)
+                    json.dump(existing, f, indent=2)
                 tagged += 1
                 if peak_truncated:
                     truncated_flagged += 1
@@ -235,7 +276,6 @@ def main():
     print(f"  Skipped (have meta) : {skipped}")
     print(f"  Failed              : {failed}")
     print(f"{'='*60}")
-    print("  Run fetch_market_context.py next to fill in market_regime.")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ import json
 import glob
 import argparse
 
-import json
 import numpy as np
 import pandas as pd
 import torch
@@ -38,13 +37,29 @@ NUM_FEATURES    = len(ALL_FEATURES)
 TRAIN_EXCHANGES = ['binance', 'kucoin', 'huobi', 'mexc', 'gateio', 'bitget']
 TEST_EXCHANGES  = ['bybit', 'okx']
 
+# 18-cell weight matrix: coin_regime × market_regime × background_volatility
+# calm background raises weight (no market noise to hide in — cleaner signal)
+# volatile background lowers weight (move may be noise amplification)
 CELL_WEIGHTS = {
-    ("pump",    "normal"):    3.0,
-    ("pump",    "uncertain"): 2.0,
-    ("pump",    "pumped"):    1.0,
-    ("control", "normal"):    2.5,
-    ("control", "uncertain"): 1.5,
-    ("control", "pumped"):    1.0,
+    # coin      market       volatility     weight
+    ("pump",    "normal",    "calm"):       4.0,
+    ("pump",    "normal",    "normal"):     3.0,
+    ("pump",    "normal",    "volatile"):   2.0,
+    ("pump",    "uncertain", "calm"):       2.5,
+    ("pump",    "uncertain", "normal"):     2.0,
+    ("pump",    "uncertain", "volatile"):   1.5,
+    ("pump",    "pumped",    "calm"):       1.5,
+    ("pump",    "pumped",    "normal"):     1.0,
+    ("pump",    "pumped",    "volatile"):   1.0,
+    ("control", "normal",    "calm"):       3.5,
+    ("control", "normal",    "normal"):     2.5,
+    ("control", "normal",    "volatile"):   1.5,
+    ("control", "uncertain", "calm"):       2.0,
+    ("control", "uncertain", "normal"):     1.5,
+    ("control", "uncertain", "volatile"):   1.0,
+    ("control", "pumped",    "calm"):       1.5,
+    ("control", "pumped",    "normal"):     1.0,
+    ("control", "pumped",    "volatile"):   1.0,
 }
 
 NEUTRAL_BUY_RATIO = 0.5
@@ -123,17 +138,21 @@ def _cell_weight(l2_path: str, label: int) -> float:
     mp = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$', '_meta.json', l2_path)
     coin_regime   = "pump" if label == 1 else "control"
     market_regime = "normal"
+    bg_volatility = "normal"
     if os.path.exists(mp):
         try:
             with open(mp) as f:
                 meta = json.load(f)
-            coin_regime   = meta.get("coin_regime",   coin_regime)
-            market_regime = meta.get("market_regime", "normal")
+            coin_regime   = meta.get("coin_regime",          coin_regime)
+            market_regime = meta.get("market_regime",        "normal")
+            bg_volatility = meta.get("background_volatility", "normal")
             if market_regime == "unknown":
                 market_regime = "normal"
+            if bg_volatility == "unknown":
+                bg_volatility = "normal"
         except Exception:
             pass
-    return CELL_WEIGHTS.get((coin_regime, market_regime), 1.5)
+    return CELL_WEIGHTS.get((coin_regime, market_regime, bg_volatility), 1.5)
 
 
 def _normalize(w: np.ndarray) -> np.ndarray:

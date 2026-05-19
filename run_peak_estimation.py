@@ -25,6 +25,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 from tag_peak_buckets import (
     compute_peak,
+    compute_background_volatility,
     get_peak_bucket,
     meta_path_for,
     regime_from_path,
@@ -103,12 +104,13 @@ def main():
 
             # Use cached meta if available and not overwriting
             if os.path.exists(mp) and not args.overwrite:
-                meta = load_existing_meta(mp)
+                meta           = load_existing_meta(mp)
                 increase       = (meta.get("peak_pct") or 0) / 100
                 retracement    = meta.get("retracement", 0.0)
                 peak_idx       = meta.get("peak_idx") or 0
                 peak_truncated = meta.get("peak_truncated", False)
                 market_regime  = meta.get("market_regime", "unknown")
+                bg_volatility  = meta.get("background_volatility", "unknown")
             else:
                 result         = compute_peak(l2_path)
                 increase       = result["increase"]
@@ -116,8 +118,8 @@ def main():
                 peak_idx       = result["peak_idx"]
                 peak_truncated = result["peak_truncated"]
                 market_regime  = "unknown"
+                bg_volatility  = compute_background_volatility(l2_path)
 
-                # Write/update meta.json with improved values
                 is_pump = (
                     coin_regime == "pump"
                     and increase    >= MIN_INCREASE
@@ -125,11 +127,12 @@ def main():
                 )
                 existing = load_existing_meta(mp)
                 existing.update({
-                    "coin_regime":    coin_regime,
-                    "peak_pct":       round(increase * 100, 2) if coin_regime == "pump" else None,
-                    "peak_bucket":    get_peak_bucket(increase) if is_pump else None,
-                    "peak_idx":       int(peak_idx) if coin_regime == "pump" else None,
-                    "peak_truncated": peak_truncated,
+                    "coin_regime":          coin_regime,
+                    "background_volatility": bg_volatility,
+                    "peak_pct":             round(increase * 100, 2) if coin_regime == "pump" else None,
+                    "peak_bucket":          get_peak_bucket(increase) if is_pump else None,
+                    "peak_idx":             int(peak_idx) if coin_regime == "pump" else None,
+                    "peak_truncated":       peak_truncated,
                 })
                 try:
                     with open(mp, "w") as f:
@@ -145,17 +148,18 @@ def main():
             )
 
             records.append({
-                "tier":            base_name,
-                "exchange":        exchange,
-                "coin_regime":     coin_regime,
-                "market_regime":   market_regime,
-                "increase_pct":    round(increase * 100, 2),
-                "retracement_pct": round(retracement * 100, 2),
-                "peak_idx":        peak_idx,
-                "peak_bucket":     get_peak_bucket(increase) if is_pump else "",
-                "peak_truncated":  peak_truncated,
-                "confirmed_pump":  is_pump,
-                "file":            os.path.relpath(l2_path, root),
+                "tier":                 base_name,
+                "exchange":             exchange,
+                "coin_regime":          coin_regime,
+                "market_regime":        market_regime,
+                "background_volatility": bg_volatility,
+                "increase_pct":         round(increase * 100, 2),
+                "retracement_pct":      round(retracement * 100, 2),
+                "peak_idx":             peak_idx,
+                "peak_bucket":          get_peak_bucket(increase) if is_pump else "",
+                "peak_truncated":       peak_truncated,
+                "confirmed_pump":       is_pump,
+                "file":                 os.path.relpath(l2_path, root),
             })
 
     if not records:
@@ -205,6 +209,13 @@ def main():
 
     # ── JSON summary ───────────────────────────────────────────────────────────
     import json as _json
+    print("\n  Background volatility distribution (all files):")
+    vol_counts = df["background_volatility"].value_counts()
+    vol_dist   = {}
+    for vol, count in vol_counts.items():
+        print(f"    {vol:<10} {count:>6}")
+        vol_dist[vol] = int(count)
+
     json_path = out_path.replace(".csv", "_summary.json")
     summary = {
         "total_files":       len(df),
@@ -215,8 +226,9 @@ def main():
             "min_increase_pct":    int(MIN_INCREASE * 100),
             "min_retracement_pct": int(RETRACEMENT_THRESHOLD * 100),
         },
-        "by_exchange": by_exchange,
-        "bucket_distribution": bucket_dist,
+        "by_exchange":              by_exchange,
+        "bucket_distribution":      bucket_dist,
+        "volatility_distribution":  vol_dist,
     }
     with open(json_path, "w") as f:
         _json.dump(summary, f, indent=2)

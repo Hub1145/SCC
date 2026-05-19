@@ -1,10 +1,7 @@
 """
 Download Real / Reconstructed / Synthetic data from Google Drive.
 
-Primary mode  — uses the Drive API v3 REST endpoints via `requests`.
-Fallback mode — if googleapis.com is blocked (SSLEOFError / firewall),
-                reads drive_manifest.json (generated locally by generate_manifest.py)
-                and downloads each file directly through drive.google.com.
+Uses the official Google Drive API v3 with MediaIoBaseDownload.
 
 Usage:
     python scripts2/fetch_from_drive.py                    # all tiers
@@ -15,16 +12,13 @@ Usage:
 
 import os
 import sys
-import json
+import io
 import argparse
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-_SCRIPTS2_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_SCRIPTS2_DIR)
-MANIFEST_PATH = os.path.join(_SCRIPTS2_DIR, "drive_manifest.json")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── Folder IDs (hardcoded — no top-level discovery needed) ────────────────────
 
@@ -36,66 +30,42 @@ TIER_FOLDERS = {
     "Synthetic":     ("115HYq5BOUPT2VVfgQUxyr6r8CVO7ELvn", "synthetic"),
 }
 
-_DRIVE_API    = "https://www.googleapis.com/drive/v3/files"
-_DRIVE_DIRECT = "https://drive.google.com/uc"
-_CHUNK        = 8 * 1024 * 1024   # 8 MB download chunks
 
-
-# ── HTTP session ───────────────────────────────────────────────────────────────
-
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://",  adapter)
-    return session
-
-
-# ── Primary: Drive API mode ───────────────────────────────────────────────────
+# ── Drive API ─────────────────────────────────────────────────────────────────
 
 class GoogleDriveAPI:
     def __init__(self, api_key: str):
-        self.key     = api_key
-        self.session = _make_session()
+        self.service = build("drive", "v3", developerKey=api_key)
 
     def list_folder(self, folder_id: str) -> list[dict]:
         items      = []
         page_token = None
         while True:
-            params = {
-                "q":        f"'{folder_id}' in parents and trashed = false",
-                "fields":   "nextPageToken, files(id, name, mimeType, size)",
-                "pageSize": 1000,
-                "key":      self.key,
-            }
-            if page_token:
-                params["pageToken"] = page_token
-            resp = self.session.get(_DRIVE_API, params=params, timeout=30)
-            resp.raise_for_status()
-            data       = resp.json()
-            items     += data.get("files", [])
-            page_token = data.get("nextPageToken")
+            resp = self.service.files().list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, mimeType, size)",
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute()
+            items     += resp.get("files", [])
+            page_token = resp.get("nextPageToken")
             if not page_token:
                 break
         return items
 
     def download_file(self, file_id: str, dest_path: str):
-        url    = f"{_DRIVE_API}/{file_id}"
-        params = {"alt": "media", "key": self.key}
+        request    = self.service.files().get_media(fileId=file_id)
+        fh         = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request, chunksize=4 * 1024 * 1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        with self.session.get(url, params=params, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=_CHUNK):
-                    if chunk:
-                        f.write(chunk)
+        with open(dest_path, "wb") as f:
+            f.write(fh.getvalue())
 
+
+# ── Recursive folder download ─────────────────────────────────────────────────
 
 def _download_recursive(api: GoogleDriveAPI, folder_id: str,
                          local_dir: str, dry_run: bool,
@@ -125,61 +95,7 @@ def _download_recursive(api: GoogleDriveAPI, folder_id: str,
     return done, skip
 
 
-# ── Fallback: manifest + drive.google.com direct download ─────────────────────
-
-def _direct_download(session: requests.Session, file_id: str, dest_path: str):
-    params = {"id": file_id, "export": "download", "confirm": "1"}
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with session.get(_DRIVE_DIRECT, params=params, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=_CHUNK):
-                if chunk:
-                    f.write(chunk)
-
-
-def _download_from_manifest(out_root: str, tiers_to_run: dict,
-                             dry_run: bool) -> tuple[int, int]:
-    if not os.path.exists(MANIFEST_PATH):
-        print("\n[ERROR] googleapis.com is blocked and no drive_manifest.json found.")
-        print("  On a machine with internet access, run:")
-        print("    python scripts2/generate_manifest.py")
-        print("  Then commit drive_manifest.json and re-run here.")
-        sys.exit(1)
-
-    with open(MANIFEST_PATH) as f:
-        manifest = json.load(f)
-
-    local_names = {local for _, local in tiers_to_run.values()}
-    files       = [e for e in manifest if e["tier_local"] in local_names]
-
-    print(f"  [manifest] {len(files)} files across {len(local_names)} tier(s)")
-
-    session    = _make_session()
-    done = skip = 0
-
-    for entry in files:
-        dest = os.path.join(out_root, entry["local_path"].replace("/", os.sep))
-        if os.path.exists(dest):
-            skip += 1
-            continue
-        print(f"  {entry['local_path']}  ({entry.get('size_kb', 0)} KB)")
-        if not dry_run:
-            _direct_download(session, entry["file_id"], dest)
-        done += 1
-
-    return done, skip
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _api_reachable(key: str) -> bool:
-    try:
-        r = requests.get(_DRIVE_API, params={"key": key}, timeout=8)
-        return r.status_code in (200, 400, 403)   # any HTTP response = reachable
-    except Exception:
-        return False
-
 
 def _get_key(cli_key: str | None) -> str:
     key = cli_key or GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
@@ -204,7 +120,7 @@ def main():
                         help="List files without downloading")
     args = parser.parse_args()
 
-    key      = _get_key(args.key)
+    api      = GoogleDriveAPI(_get_key(args.key))
     out_root = os.path.abspath(args.root)
 
     tiers_to_run = (
@@ -213,27 +129,17 @@ def main():
         else TIER_FOLDERS
     )
 
-    # ── Connectivity check — pick mode ────────────────────────────────────────
-    if _api_reachable(key):
-        print("  [mode] Drive API (googleapis.com)")
-        api = GoogleDriveAPI(key)
+    total_done = total_skip = 0
 
-        total_done = total_skip = 0
-        for drive_name, (folder_id, local_name) in tiers_to_run.items():
-            local_dir = os.path.join(out_root, local_name)
-            print(f"\n-- {drive_name}  ({folder_id})")
-            print(f"   -> {local_dir}")
-            try:
-                done, skip = _download_recursive(api, folder_id, local_dir, args.dry_run)
-            except Exception as e:
-                print(f"\n[ERROR] {e}")
-                sys.exit(1)
-            total_done += done; total_skip += skip
-            print(f"   downloaded={done}  skipped(exist)={skip}")
+    for drive_name, (folder_id, local_name) in tiers_to_run.items():
+        local_dir = os.path.join(out_root, local_name)
+        print(f"\n-- {drive_name}  ({folder_id})")
+        print(f"   -> {local_dir}")
 
-    else:
-        print("  [mode] Manifest fallback (googleapis.com blocked, using drive.google.com)")
-        total_done, total_skip = _download_from_manifest(out_root, tiers_to_run, args.dry_run)
+        done, skip  = _download_recursive(api, folder_id, local_dir, args.dry_run)
+        total_done += done
+        total_skip += skip
+        print(f"   downloaded={done}  skipped(exist)={skip}")
 
     print(f"\nTotal: {total_done} downloaded, {total_skip} already on disk.")
     if args.dry_run:
